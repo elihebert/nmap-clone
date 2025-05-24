@@ -33,7 +33,7 @@ A modern, performance-enhanced network scanner inspired by Nmap, built with Pyth
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/netscan.git
+git clone https://github.com/elihebert/netscan.git
 cd netscan
 
 # Install dependencies

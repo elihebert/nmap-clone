@@ -169,9 +169,16 @@ def create_scan_options(ctx_params: dict) -> ScanOptions:
     
     if ctx_params.get('aggressive'):
         options.version_detection = True
+        options.full_version_detection = True  # Enable full version detection for aggressive
         options.os_detection = True
         options.traceroute = True
         options.script_scan = True
+        # Set aggressive timing if not already specified
+        if not ctx_params.get('timing'):
+            options.timing = TimingTemplate.AGGRESSIVE
+            template_args = timing_template_args(TimingTemplate.AGGRESSIVE)
+            for key, value in template_args.items():
+                setattr(options, key, value)
     
     if ctx_params.get('ipv6'):
         options.ipv6 = True
@@ -293,6 +300,27 @@ Scan Summary:
         
         if host_result.ports:
             console.print(table)
+            
+            # Display vulnerability information for each port
+            for port, port_result in sorted_ports:
+                if port_result.script_results:
+                    # Check for vulnerability scan results
+                    if 'vulnerability-scan' in port_result.script_results:
+                        vulns = port_result.script_results['vulnerability-scan']
+                        if vulns:
+                            vuln_text = f"[bold red]Port {port} Vulnerabilities:[/bold red]\n"
+                            for vuln in vulns:
+                                vuln_text += f"  • {vuln}\n"
+                            console.print(Panel(vuln_text.strip(), style="red"))
+                    
+                    # Check for service-specific vulnerabilities
+                    if 'vulns' in port_result.script_results:
+                        vulns = port_result.script_results['vulns']
+                        if vulns:
+                            issue_text = f"[bold yellow]Port {port} Service Issues:[/bold yellow]\n"
+                            for vuln in vulns:
+                                issue_text += f"  • {vuln}\n"
+                            console.print(Panel(issue_text.strip(), style="yellow"))
         
         # Display OS detection results
         if host_result.os_matches:

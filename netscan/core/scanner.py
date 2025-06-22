@@ -16,6 +16,7 @@ import ipaddress
 from concurrent.futures import ThreadPoolExecutor
 import aiohttp
 import netifaces
+import re
 
 # Configure scapy before importing to suppress warnings
 import scapy.config
@@ -318,8 +319,23 @@ class Scanner:
         if self.options.version_detection:
             await self._version_detection()
         
+        # Aggressive scanning includes enhanced version detection
+        if self.options.timing == TimingTemplate.AGGRESSIVE or self.options.full_version_detection:
+            logger.info("Performing aggressive version detection")
+            for host_ip, host_result in self.results.items():
+                for port, port_result in host_result.ports.items():
+                    if port_result.state == "open":
+                        await self._aggressive_version_detection(host_ip, port, port_result)
+        
         if self.options.os_detection:
-            await self._os_detection()
+            # Use enhanced OS detection for aggressive scanning
+            if self.options.timing == TimingTemplate.AGGRESSIVE:
+                await self._enhanced_os_detection()
+            else:
+                await self._os_detection()
+        
+        if self.options.script_scan:
+            await self._script_scanning()
         
         if self.options.traceroute:
             await self._traceroute()
@@ -1042,6 +1058,442 @@ class Scanner:
         # - TCP SYN traceroute
         # - UDP traceroute
         pass
+
+    async def _aggressive_version_detection(self, host: str, port: int, port_result: PortResult):
+        """Perform aggressive version detection with multiple probes"""
+        # Enhanced banner grabbing with multiple probe strings
+        probes = [
+            # Generic probes
+            b"",  # Empty probe
+            b"\r\n\r\n",  # Double CRLF
+            b"HELP\r\n",
+            b"QUIT\r\n",
+            b"GET / HTTP/1.0\r\n\r\n",
+            b"HEAD / HTTP/1.0\r\n\r\n",
+            b"OPTIONS * HTTP/1.0\r\n\r\n",
+            
+            # Service-specific probes
+            b"USER anonymous\r\n",  # FTP
+            b"EHLO test\r\n",  # SMTP
+            b"SSH-2.0-OpenSSH_7.4\r\n",  # SSH
+            b"\x00\x00\x00\x0a\x00\x00\x00\x00\x00\x00\x00\x00",  # MySQL
+            b"STATS\r\n",  # Memcached
+            b"INFO\r\n",  # Redis
+            b"*1\r\n$4\r\nping\r\n",  # Redis PING
+            b"CAP LS\r\n",  # IRC
+            b"<policy-file-request/>\x00",  # Flash policy
+        ]
+        
+        best_result = None
+        best_confidence = 0
+        
+        for probe in probes:
+            try:
+                result = await self._send_probe_and_analyze(host, port, probe)
+                if result and result.get('confidence', 0) > best_confidence:
+                    best_result = result
+                    best_confidence = result['confidence']
+                    
+                    # Stop if we have high confidence
+                    if best_confidence > 0.8:
+                        break
+                        
+            except Exception:
+                continue
+        
+        if best_result:
+            port_result.service = best_result.get('service', port_result.service)
+            port_result.version = best_result.get('version', port_result.version)
+            
+            # Add any detected vulnerabilities
+            if 'vulnerabilities' in best_result:
+                port_result.script_results['vulns'] = best_result['vulnerabilities']
+    
+    async def _send_probe_and_analyze(self, host: str, port: int, probe: bytes) -> Optional[Dict]:
+        """Send a probe and analyze the response"""
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port),
+                timeout=3.0
+            )
+            
+            # Send probe
+            if probe:
+                writer.write(probe)
+                await writer.drain()
+            
+            # Read response
+            response = await asyncio.wait_for(reader.read(4096), timeout=2.0)
+            
+            writer.close()
+            await writer.wait_closed()
+            
+            if response:
+                return self._analyze_aggressive_banner(response.decode('utf-8', errors='ignore'), port)
+                
+        except Exception:
+            pass
+        
+        return None
+    
+    def _analyze_aggressive_banner(self, banner: str, port: int) -> Dict[str, any]:
+        """Enhanced banner analysis for aggressive scanning"""
+        result = {
+            'confidence': 0.0
+        }
+        
+        # Enhanced service fingerprints with vulnerability detection
+        fingerprints = [
+            # SSH with vulnerability detection
+            (r'SSH-(\d+\.\d+)-(.+)', 'ssh', 
+             lambda m: f"SSH {m.group(1)} ({m.group(2)})", 0.95,
+             lambda m: ['SSH Protocol 1 (vulnerable)'] if 'SSH-1.' in m.group(0) else []),
+            
+            # HTTP/Web servers with version extraction
+            (r'Server:\s*Apache/(\S+)', 'http', 
+             lambda m: f"Apache {m.group(1)}", 0.9,
+             lambda m: ['Apache 2.2.x (EOL)'] if 'Apache/2.2.' in m.group(0) else []),
+            (r'Server:\s*nginx/(\S+)', 'http', 
+             lambda m: f"nginx {m.group(1)}", 0.9,
+             lambda m: ['nginx 1.0.x (outdated)'] if 'nginx/1.0.' in m.group(0) else []),
+            (r'Server:\s*Microsoft-IIS/(\S+)', 'http', 
+             lambda m: f"Microsoft IIS {m.group(1)}", 0.9,
+             lambda m: ['IIS 6.0 (severely outdated)'] if 'IIS/6.0' in m.group(0) else []),
+            
+            # Database servers
+            (r'MySQL.*\s+(\d+\.\d+\.\d+)', 'mysql', 
+             lambda m: f"MySQL {m.group(1)}", 0.9,
+             lambda m: []),
+            (r'PostgreSQL\s+(\d+\.\d+)', 'postgresql', 
+             lambda m: f"PostgreSQL {m.group(1)}", 0.9,
+             lambda m: []),
+            (r'\$.*redis_version:(\d+\.\d+\.\d+)', 'redis', 
+             lambda m: f"Redis {m.group(1)}", 0.9,
+             lambda m: ['Redis unprotected'] if 'requirepass' not in banner else []),
+            
+            # FTP servers
+            (r'220.*ProFTPD\s+(\S+)', 'ftp', 
+             lambda m: f"ProFTPD {m.group(1)}", 0.9,
+             lambda m: []),
+            (r'220.*vsftpd\s+(\S+)', 'ftp', 
+             lambda m: f"vsftpd {m.group(1)}", 0.9,
+             lambda m: []),
+            
+            # SMTP servers
+            (r'220.*Postfix', 'smtp', 
+             lambda m: "Postfix", 0.9,
+             lambda m: []),
+            (r'220.*Exim\s+(\S+)', 'smtp', 
+             lambda m: f"Exim {m.group(1)}", 0.9,
+             lambda m: []),
+            
+            # Other services
+            (r'RFB\s+(\d{3}\.\d{3})', 'vnc', 
+             lambda m: f"VNC (RFB {m.group(1)})", 0.95,
+             lambda m: []),
+        ]
+        
+        for pattern, service, version_func, confidence, vuln_func in fingerprints:
+            match = re.search(pattern, banner, re.IGNORECASE | re.MULTILINE)
+            if match:
+                result['service'] = service
+                result['version'] = version_func(match)
+                result['confidence'] = confidence
+                vulnerabilities = vuln_func(match)
+                if vulnerabilities:
+                    result['vulnerabilities'] = vulnerabilities
+                break
+        
+        return result
+    
+    async def _enhanced_os_detection(self):
+        """Enhanced OS detection with TCP/IP stack fingerprinting"""
+        logger.info("Performing enhanced OS detection")
+        
+        for host_ip, host_result in self.results.items():
+            # Find an open port for OS detection
+            open_port = None
+            for port, port_result in host_result.ports.items():
+                if port_result.state == "open":
+                    open_port = port
+                    break
+            
+            if not open_port:
+                continue
+            
+            # Perform TCP/IP stack fingerprinting
+            os_fingerprint = await self._tcp_stack_fingerprinting(host_ip, open_port)
+            
+            # Match against OS database
+            os_matches = self._match_os_fingerprint(os_fingerprint)
+            
+            # Store top matches
+            host_result.os_matches = os_matches[:3]  # Top 3 matches
+    
+    async def _tcp_stack_fingerprinting(self, host: str, port: int) -> Dict:
+        """Perform TCP/IP stack fingerprinting"""
+        fingerprint = {
+            'ttl': None,
+            'window_size': None,
+            'tcp_options': None,
+            'df_bit': None,
+            'tcp_timestamp': None,
+        }
+        
+        try:
+            # Send SYN packet with specific options
+            ip = IP(dst=host)
+            tcp = TCP(
+                sport=random.randint(1024, 65535),
+                dport=port,
+                flags='S',
+                seq=random.randint(0, 2**32-1),
+                window=5840,
+                options=[
+                    ('MSS', 1460),
+                    ('SAckOK', b''),
+                    ('Timestamp', (0, 0)),
+                    ('NOP', None),
+                    ('WScale', 7)
+                ]
+            )
+            
+            packet = ip/tcp
+            
+            # Send and receive response
+            response = await asyncio.get_event_loop().run_in_executor(
+                self.executor,
+                lambda: sr1(packet, timeout=2, verbose=0)
+            )
+            
+            if response and response.haslayer(TCP):
+                # Extract fingerprint data
+                fingerprint['ttl'] = response[IP].ttl if response.haslayer(IP) else None
+                fingerprint['window_size'] = response[TCP].window
+                fingerprint['df_bit'] = bool(response[IP].flags & 0x2) if response.haslayer(IP) else None
+                
+                # Extract TCP options
+                tcp_options = []
+                for opt in response[TCP].options:
+                    if opt[0] == 'MSS':
+                        tcp_options.append(f"MSS={opt[1]}")
+                    elif opt[0] == 'WScale':
+                        tcp_options.append(f"WS={opt[1]}")
+                    elif opt[0] == 'Timestamp':
+                        fingerprint['tcp_timestamp'] = True
+                        tcp_options.append("TS")
+                    elif opt[0] == 'SAckOK':
+                        tcp_options.append("SACK")
+                
+                fingerprint['tcp_options'] = ','.join(tcp_options)
+                
+        except Exception as e:
+            logger.debug(f"TCP fingerprinting failed: {e}")
+        
+        return fingerprint
+    
+    def _match_os_fingerprint(self, fingerprint: Dict) -> List[Dict]:
+        """Match fingerprint against OS database"""
+        os_database = {
+            'Windows 10': {
+                'ttl': [128, 127],
+                'window': [8192, 65535],
+                'df': True,
+                'timestamp': True,
+            },
+            'Windows 7/8': {
+                'ttl': [128, 127],
+                'window': [8192],
+                'df': True,
+                'timestamp': True,
+            },
+            'Linux 5.x': {
+                'ttl': [64, 63],
+                'window': [65535, 29200],
+                'df': True,
+                'timestamp': True,
+            },
+            'Linux 4.x': {
+                'ttl': [64, 63],
+                'window': [29200, 14600],
+                'df': True,
+                'timestamp': True,
+            },
+            'macOS 11/12': {
+                'ttl': [64, 63],
+                'window': [65535],
+                'df': True,
+                'timestamp': True,
+            },
+            'FreeBSD': {
+                'ttl': [64],
+                'window': [65535],
+                'df': True,
+                'timestamp': True,
+            },
+        }
+        
+        matches = []
+        
+        for os_name, os_sig in os_database.items():
+            score = 0
+            
+            # Check TTL
+            if fingerprint.get('ttl') in os_sig.get('ttl', []):
+                score += 30
+            
+            # Check window size
+            if fingerprint.get('window_size') in os_sig.get('window', []):
+                score += 25
+            
+            # Check DF bit
+            if fingerprint.get('df_bit') == os_sig.get('df'):
+                score += 20
+            
+            # Check timestamp
+            if fingerprint.get('tcp_timestamp') == os_sig.get('timestamp'):
+                score += 25
+            
+            if score > 0:
+                matches.append({
+                    'name': os_name,
+                    'accuracy': score,
+                    'cpe': self._generate_os_cpe(os_name),
+                })
+        
+        # Sort by accuracy
+        matches.sort(key=lambda x: x['accuracy'], reverse=True)
+        
+        return matches
+    
+    def _generate_os_cpe(self, os_name: str) -> str:
+        """Generate CPE string for OS"""
+        # Simplified CPE generation
+        if 'Windows' in os_name:
+            return f"cpe:/o:microsoft:windows"
+        elif 'Linux' in os_name:
+            return f"cpe:/o:linux:linux_kernel"
+        elif 'macOS' in os_name:
+            return f"cpe:/o:apple:macos"
+        elif 'FreeBSD' in os_name:
+            return f"cpe:/o:freebsd:freebsd"
+        else:
+            return f"cpe:/o:unknown:unknown"
+    
+    async def _script_scanning(self):
+        """Perform script scanning for vulnerability detection"""
+        logger.info("Performing script scanning")
+        
+        for host_ip, host_result in self.results.items():
+            for port, port_result in host_result.ports.items():
+                if port_result.state == "open":
+                    # Run vulnerability checks based on service
+                    vulns = await self._check_service_vulnerabilities(
+                        host_ip, port, port_result
+                    )
+                    
+                    if vulns:
+                        port_result.script_results['vulnerability-scan'] = vulns
+    
+    async def _check_service_vulnerabilities(self, host: str, port: int, 
+                                           port_result: PortResult) -> List[str]:
+        """Check for common vulnerabilities based on service"""
+        vulnerabilities = []
+        
+        service = port_result.service
+        version = port_result.version or ''
+        
+        # SSH vulnerabilities
+        if service == 'ssh':
+            if 'SSH 1.' in version or 'SSH-1.' in version:
+                vulnerabilities.append('SSH Protocol 1 enabled (CVE-2001-0361)')
+            if 'OpenSSH 7.2' in version:
+                vulnerabilities.append('OpenSSH 7.2 username enumeration (CVE-2016-6210)')
+        
+        # HTTP vulnerabilities
+        elif service == 'http':
+            # Check for outdated web servers
+            if 'Apache/2.2' in version:
+                vulnerabilities.append('Apache 2.2.x is EOL and may have unpatched vulnerabilities')
+            elif 'nginx/1.0' in version:
+                vulnerabilities.append('nginx 1.0.x is outdated')
+            elif 'IIS/6.0' in version:
+                vulnerabilities.append('IIS 6.0 has multiple known vulnerabilities')
+            
+            # Check for common paths
+            common_paths = ['/.git/', '/.env', '/wp-admin/', '/phpmyadmin/']
+            for path in common_paths:
+                if await self._check_http_path(host, port, path):
+                    vulnerabilities.append(f'Sensitive path exposed: {path}')
+        
+        # FTP vulnerabilities
+        elif service == 'ftp':
+            # Check anonymous login
+            if await self._check_ftp_anonymous(host, port):
+                vulnerabilities.append('FTP anonymous login allowed')
+        
+        # Database vulnerabilities
+        elif service in ['mysql', 'postgresql', 'mongodb', 'redis']:
+            vulnerabilities.append(f'{service} may be using default credentials')
+        
+        return vulnerabilities
+    
+    async def _check_http_path(self, host: str, port: int, path: str) -> bool:
+        """Check if HTTP path exists"""
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port),
+                timeout=2.0
+            )
+            
+            request = f"HEAD {path} HTTP/1.0\r\nHost: {host}\r\n\r\n"
+            writer.write(request.encode())
+            await writer.drain()
+            
+            response = await asyncio.wait_for(reader.read(1024), timeout=2.0)
+            writer.close()
+            await writer.wait_closed()
+            
+            # Check if path exists (2xx, 3xx, or 403 response)
+            response_str = response.decode('utf-8', errors='ignore')
+            if 'HTTP/1.' in response_str:
+                status_code = int(response_str.split()[1])
+                return status_code in range(200, 400) or status_code == 403
+                
+        except Exception:
+            pass
+        
+        return False
+    
+    async def _check_ftp_anonymous(self, host: str, port: int) -> bool:
+        """Check if FTP allows anonymous login"""
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port),
+                timeout=3.0
+            )
+            
+            # Read banner
+            await asyncio.wait_for(reader.readline(), timeout=2.0)
+            
+            # Try anonymous login
+            writer.write(b"USER anonymous\r\n")
+            await writer.drain()
+            
+            response = await asyncio.wait_for(reader.readline(), timeout=2.0)
+            
+            writer.write(b"QUIT\r\n")
+            await writer.drain()
+            writer.close()
+            await writer.wait_closed()
+            
+            # Check if anonymous login is allowed (331 response)
+            return b'331' in response
+            
+        except Exception:
+            pass
+        
+        return False
 
 
 def timing_template_args(template: TimingTemplate) -> Dict[str, any]:

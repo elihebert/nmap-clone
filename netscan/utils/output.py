@@ -66,6 +66,17 @@ class OutputFormatter:
                         f.write(f"{port_num}/{proto:<5} {port.state:<9} ")
                         f.write(f"{port.service or '':<11} ")
                         f.write(f"{port.version or ''}\n")
+                        
+                        # Show script results if any
+                        if port.script_results:
+                            for script_name, script_output in port.script_results.items():
+                                f.write(f"    |_{script_name}: ")
+                                if isinstance(script_output, list):
+                                    f.write("\n")
+                                    for item in script_output:
+                                        f.write(f"      - {item}\n")
+                                else:
+                                    f.write(f"{script_output}\n")
                 
                 # OS detection results
                 if host_result.os_matches:
@@ -344,6 +355,26 @@ class OutputFormatter:
                     host_html += f'<td>{port.service or "-"}</td>'
                     host_html += f'<td>{port.version or "-"}</td>'
                     host_html += f'</tr>'
+                    
+                    # Add vulnerability row if found
+                    if port.script_results and 'vulnerability-scan' in port.script_results:
+                        vulns = port.script_results['vulnerability-scan']
+                        if vulns:
+                            host_html += '<tr><td colspan="4" style="padding-left: 20px; background-color: #ffebee;">'
+                            host_html += '<strong>Vulnerabilities:</strong><br>'
+                            for vuln in vulns:
+                                host_html += f'• {vuln}<br>'
+                            host_html += '</td></tr>'
+                    
+                    # Add other script results
+                    if port.script_results and 'vulns' in port.script_results:
+                        vulns = port.script_results['vulns']
+                        if vulns:
+                            host_html += '<tr><td colspan="4" style="padding-left: 20px; background-color: #fff3e0;">'
+                            host_html += '<strong>Service Issues:</strong><br>'
+                            for vuln in vulns:
+                                host_html += f'• {vuln}<br>'
+                            host_html += '</td></tr>'
                 
                 host_html += '</table>'
             
